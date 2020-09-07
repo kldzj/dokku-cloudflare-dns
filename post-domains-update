@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/config/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/domains/functions"
+
+if ! which jq >/dev/null 2>&1; then
+  dokku_log_fail "Missing jq, install it"
+fi
+
+if ! which curl >/dev/null 2>&1; then
+  dokku_log_fail "Missing curl, install it"
+fi
+
+record_tpl='{id: .id, name: .name, content: .content}'
+export CF_SERVER_IP=$(config_get --global CF_SERVER_IP || "")
+export CF_TOKEN=$(config_get --global CF_TOKEN || "")
+export CF_DEBUG=$(config_get --global CF_DEBUG || false)
+
+function _log() {
+  echo "$1" | sed 's/^/       /'
+}
+
+function _fail_if_error() {
+  local code=$1
+  local message=$2
+
+  if [ $code -ne 0 ]; then
+    dokku_log_fail $message
+  fi
+}
+
+function pretty_print() {
+  _log "$(echo "$1" | jq '.')"
+}
+
+function get_domain_from_domain_with_sub() {
+  local domain=$1
+  echo $(psl --print-reg-domain "$domain" | sed 's/'"$domain"': //')
+}
+
+function get_cf_zone_id_by_name() {
+  local zone=$1
+  local result=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone" \
+    -H "Authorization: Bearer $CF_TOKEN" \
+    -H "Content-Type: application/json")
+
+  local zone_id="$(echo $result | jq -r '.result[0].id?')"
+  if [[ -z "$zone_id" || "$zone_id" == "null" ]]; then
+    echo ""
+  else
+    echo "$zone_id"
+  fi
+}
+
+function list_cf_records_for_zone() {
+  declare desc="List Cloudflare zone's DNS records"
+  local zone_id=$1
+
+  local records_data=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=A&per_page=100" \
+    -H "Authorization: Bearer $CF_TOKEN" \
+    -H "Content-Type: application/json")
+
+  echo $(echo $records_data | jq "[ .result[] | $record_tpl ]?")
+}
+
+function create_cf_dns_record() {
+  declare desc="Create a new DNS record via the Cloudflare API"
+  local zone_id=$1
+  local domain=$2
+
+  local result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
+    -H "Authorization: Bearer $CF_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "{\"type\":\"A\",\"name\":\"$domain\",\"content\":\"$CF_SERVER_IP\",\"proxied\":true}")
+
+  if [[ $? -ne 0 ]]; then
+    _log "Failed to create DNS record (ZoneID: $zone_id; Domain: $domain)"
+  fi
+
+  pretty_print "$result"
+}
+
+function delete_cf_dns_record() {
+  declare desc="Delete a DNS record via the Cloudflare API"
+  local zone_id=$1
+  local record_id=$2
+
+  local result=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" \
+    -H "Authorization: Bearer $CF_TOKEN" \
+    -H "Content-Type: application/json")
+
+  if [ $? -ne 0 ]; then
+    dokku_log_fail "Failed to delete dns record :/"
+  fi
+
+  pretty_print "$result"
+}
+
+function update_cf_zone() {
+  declare desc="Update Cloudflare zone's dns records to reflect dokku domains configuration"
+  echo "-----> Configuring Cloudflare Zone DNS"
+
+  if [ -z "$CF_SERVER_IP" ] || [ -z "$CF_TOKEN" ]; then
+    dokku_log_fail "Missing environment variables"
+  fi
+
+  local APP="$1"
+  verify_app_name "$APP"
+
+  local domains=$(get_app_domains $APP)
+  _log "checking domains: $(echo $domains | tr '\n' ' ' | sed '$s/ $/\n/')"
+  echo ""
+
+  for domain in $domains; do
+    domain=$(echo $domain | sed 's/(,|\s+)//')
+    if [[ -z "$domain" ]]; then
+      continue
+    fi
+
+    local root_domain=$(get_domain_from_domain_with_sub $domain)
+    local zone_id=$(get_cf_zone_id_by_name $root_domain)
+
+    if [[ -z "$zone_id" || $? -ne 0 ]]; then
+      _log "skipping $domain as it is not managed by Cloudflare (Zone ID for '$root_domain' could not be found)"
+      continue
+    fi
+
+    _log "retrieving existing records for $root_domain..."
+    local records=$(list_cf_records_for_zone "$zone_id" "$root_domain")
+
+    if [[ "$domain" == *".$root_domain" || "$domain" == "$root_domain" ]]; then
+      local existing_record=$(echo "$records" | jq ".[] | select(.name == \""$domain"\") | $record_tpl")
+      if [ -z "$existing_record" ]; then
+        _log "$domain A record does not exist"
+        _log "creating proxied dns record ($domain -> $CF_SERVER_IP)..."
+        create_cf_dns_record $zone_id $domain
+      else
+        local record_content=$(echo "$existing_record" | jq -r '.content')
+        if [ $record_content != "$CF_SERVER_IP" ]; then
+          _log "dns record content ($record_content) for $domain does not match server ip $CF_SERVER_IP..."
+          local record_id=$(echo "$existing_record" | jq -r '.id')
+          _log "deleting dns record $record_id ($domain -> $record_content)..."
+          delete_cf_dns_record $zone_id $record_id
+          _log "creating proxied dns record ($domain -> $CF_SERVER_IP)..."
+          create_cf_dns_record $zone_id $domain
+        else
+          _log "skipping $domain as record content is up to date..."
+        fi
+      fi
+    else
+      _log "skipping $domain as it is not in the zone ($root_domain)"
+    fi
+
+    echo ""
+  done
+}
+
+update_cf_zone "$@"

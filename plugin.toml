@@ -1,0 +1,4 @@
+[plugin]
+description = "dokku deployment hook for changing cloudflare dns records"
+version = "0.2.0"
+[plugin.config]
